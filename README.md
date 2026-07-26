@@ -24,9 +24,12 @@ Submission for the Senior Backend take-home challenge. The original brief is kep
 | 7 | Test suite (happy path, no vendor, replay, retry, concurrency) | ✅ all five covered |
 | 8 | Design note + incident playbook | ✅ done |
 
-Fault simulation in `FakeVendorGateway` (timeouts, transient failures) is deliberately deferred:
-resilience is proven by the unit tests. Capacity exhaustion, failover and the resulting `503` **can**
-be staged live through the test-support endpoint below.
+`FakeVendorGateway` never times out or fails transiently, by choice: those paths are exercised by the
+unit tests, where the outcome sequence is dictated and the backoff schedule is asserted. Teaching the
+fake to fail randomly would make the behaviour visible in Swagger but not better tested — and a fake
+that fails on its own makes every other manual check flaky. Capacity exhaustion and failover *are*
+reproducible live, through the test-support endpoint below, because those depend on state rather than
+on timing.
 
 Current suite: **58 tests, all passing**.
 
