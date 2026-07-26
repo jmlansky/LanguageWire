@@ -17,14 +17,17 @@ Submission for the Senior Backend take-home challenge. The original brief is kep
 |---|------|--------|
 | 1 | Baseline fixed and building, first test in place | ✅ done |
 | 2 | Idempotency: deterministic replay + in-progress rejection | ✅ done |
-| 3 | Vendor call resilience (timeout, bounded backoff, transient vs terminal) | ⬜ pending |
+| 3 | Vendor call resilience (timeout, bounded backoff, transient vs terminal) | ✅ done |
 | 4 | Assignment decision: priority, due date, tie-breaks | ⬜ pending |
 | 5 | API layer: request validation | 🟡 endpoints and status codes done, input validation pending |
 | 6 | Observability: structured logs, correlation id, metrics | ⬜ pending |
-| 7 | Test suite (happy path, no vendor, replay, retry, concurrency) | 🟡 4 of 5 — retry lands with step 3 |
+| 7 | Test suite (happy path, no vendor, replay, retry, concurrency) | ✅ all five covered |
 | 8 | Design note + incident playbook | 🟡 design note in progress, playbook pending |
 
-Current suite: **6 tests, all passing**.
+Fault simulation in `FakeVendorGateway` is deliberately deferred: resilience is proven by the unit
+tests, and teaching the fake to fail is what will make it observable from Swagger.
+
+Current suite: **18 tests, all passing**.
 
 ---
 
@@ -119,8 +122,13 @@ on the response without parsing the body:
 |---------|--------|------------------------|
 | `Assigned` | `200` | Assigned. A replay of a previous assignment also returns `200`, plus the header `Idempotent-Replay: true` |
 | `AlreadyInProgress` | `409` | The same `jobId` is being processed right now — retry shortly |
-| `NoMatchingVendor` | `422` | The request is well-formed but cannot be fulfilled as-is |
-| `VendorReservationFailed` | `503` | The vendor side failed — retrying is worthwhile |
+| `NoMatchingVendor` | `422` | No vendor handles this language pair — retrying will not help |
+| `NoCapacityAvailable` | `503` | Every capable vendor declined — a capacity problem, retry later |
+| `VendorUnavailable` | `503` | A vendor could not be reached after its retries — a technical problem |
+
+The last two share a status code because the caller does the same thing either way, but they are
+separate outcomes on purpose: one means capacity has to be bought, the other means someone should be
+paged.
 
 ---
 
@@ -173,6 +181,72 @@ more predictable contract: no request is held open on a lock it does not own, an
 needs a retry path for transient vendor failures, so that path is reused instead of introducing a
 second waiting mechanism.
 
+### Resilience lives above the gateway, not inside it
+
+The starter kept retries, backoff and timeout inside `FakeVendorGateway` — a throwaway class. That
+code would have been lost the day the fake is replaced by a real vendor client, and because the fake
+never fails it never executed, so nothing proved it worked.
+
+It now sits in `ResilientVendorGateway`, a decorator over `IVendorGateway`:
+
+```
+AssignmentEngine  ->  ResilientVendorGateway  ->  IVendorGateway (fake today, real client tomorrow)
+                      per-attempt timeout,        one call, one answer,
+                      bounded backoff, retries    no policy of its own
+```
+
+Each layer has one job: the gateway talks to the vendor, the decorator decides whether to insist, the
+engine decides who to assign to. The engine resolves `IVendorGateway` and never learns that retries
+exist, so the policy can be removed or replaced without touching it.
+
+### A boolean cannot say "I don't know"
+
+`ReserveCapacityAsync` used to return `bool`, which collapsed three different situations into one
+`false`. `VendorReservation` replaces it:
+
+| Status | Meaning | Retried? |
+|--------|---------|----------|
+| `Reserved` | Capacity is held | — |
+| `Rejected` | The vendor answered and declined | **No** — its answer will not change |
+| `TransientFailure` | The call failed before the vendor could act | Yes |
+| `Uncertain` | Timed out, or an answer we could not interpret | Yes, and counted separately |
+
+`Uncertain` exists because of the partial responses the brief warns about. It is retried like a
+transient failure but tracked apart, because it is the dangerous one: the vendor may already have
+reserved, so a retry risks double-booking. The real fix is to send the `jobId` as the vendor-side
+idempotency key and let the vendor deduplicate — the same idea used at our own API boundary, one
+level down. That depends on the vendor supporting it, so it is documented rather than implemented.
+
+Rejections also carry a reason (`NoCapacity`, `PairNotSupported`, `QuotaExceeded`, `Unknown`). They
+drive different responses: `NoCapacity` may clear on its own, `QuotaExceeded` is a commercial
+conversation, and `PairNotSupported` should be impossible — we filter by language pair before
+calling, so seeing it means our view of the vendor's catalogue is stale. That is worth knowing.
+
+### The best vendor that accepts, not merely the best one
+
+Candidates are ranked (least loaded, then cheapest, then best quality) and the engine now walks that
+ranking instead of giving up on the first one. A vendor that declines is skipped immediately without
+retries; one that could not be reached has already exhausted its retry policy by the time the engine
+sees it.
+
+If the list runs out, the outcome distinguishes **why**: `NoCapacityAvailable` when everyone simply
+declined, `VendorUnavailable` when at least one vendor never answered. Under a boolean both were the
+same failure, and the difference is exactly what tells an operator whether to buy capacity or wake
+someone up.
+
+### Backoff and testability
+
+Waiting and randomness are injected into `ResilientVendorGateway` rather than called directly. In
+production the wait is `Task.Delay`; in tests it is a function that records what was requested and
+returns immediately. That makes the schedule assertable — the suite checks that delays grow
+`100ms, 200ms, 300ms, 300ms` and stop at the ceiling — and keeps the whole suite under a second.
+
+Jitter is a fraction of the delay (20% by default) rather than the starter's fixed 0–25ms, which
+became negligible once the backoff grew and stopped spreading retries apart.
+
+Timeouts are classified as `Uncertain`, never as clean failures. Caller cancellation is rethrown
+instead of being swallowed: a client that walked away is not a vendor problem and must not be retried.
+
 ### Outcomes are a closed set, not free text
 
 `AssignmentOutcome` is an enum and the human-readable `Reason` is derived from it, so the text shown
@@ -215,17 +289,39 @@ and operability instead.
 
 ## Tests
 
+18 tests, no `sleep` anywhere except a single 50ms timeout probe.
+
+**Assignment engine**
+
 | Test | What it protects |
 |------|------------------|
 | `WithCapableVendor_AssignsAndPublishesOnce` | Happy path, and that success is persisted and the lease released |
 | `WithNoCapableVendor_FailsWithoutCallingVendorOrPublishing` | No-vendor path leaves no trace and does not poison the job |
+| `WhenBestVendorRejects_FallsBackToTheNextRankedVendor` | Failover follows the preference order |
+| `WhenEveryVendorRejects_ReportsNoCapacityRatherThanAnOutage` | A capacity problem is not reported as an outage |
+| `WhenAVendorCannotBeReached_ReportsVendorUnavailable` | An unreachable vendor outweighs a mere rejection, and stays retryable |
 | `RepeatedAfterCompletion_ReplaysStoredResultWithoutReassigning` | Replay returns the same assignment; vendor and publisher are not called again |
 | `WhileFirstRequestIsStillInFlight_ReportsAlreadyInProgress` | In-flight duplicate is rejected while the winner is still working |
 | `ConcurrentRequestsForSameJob_ProduceExactlyOneAssignment` | 32 simultaneous requests produce exactly one reservation and one event |
 | `AfterAFailedAttempt_CanBeRetriedSuccessfully` | A failure does not consume the idempotency key |
 
-The in-flight test uses a vendor gateway that parks inside the call until the test releases it, so the
-overlap is deterministic rather than timing-dependent.
+**Resilience layer**
+
+| Test | What it protects |
+|------|------------------|
+| `WhenVendorReservesImmediately_DoesNotRetryOrWait` | The happy path costs nothing extra |
+| `WhenVendorRejects_DoesNotRetry` | A definitive answer is never retried |
+| `WhenTransientFailureThenSuccess_RetriesAndSucceeds` | Retry actually recovers |
+| `WhenAlwaysFailing_StopsAtMaxAttemptsAndReportsTerminalFailure` | Retries are bounded, with no wait after the last attempt |
+| `BacksOffExponentially_WithoutExceedingTheCeiling` | The exact schedule, and that it stops growing |
+| `AddsJitterWithinTheConfiguredFraction` | Jitter stays proportional and bounded |
+| `WhenAnAttemptTimesOut_ReportsUncertainRatherThanFailure` | A timeout is ambiguity, not a clean failure |
+| `WhenGatewayThrows_TreatsItAsTransientAndRetries` | A throwing client is classified, not leaked |
+| `WhenCallerCancels_PropagatesInsteadOfSwallowing` | Caller cancellation is not mistaken for a vendor fault |
+
+Two details make the suite deterministic: the in-flight test uses a gateway that parks inside the call
+until released, so the overlap does not depend on timing; and the resilience tests inject the wait, so
+the backoff schedule is asserted rather than endured.
 
 ---
 

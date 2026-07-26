@@ -8,8 +8,15 @@ public enum AssignmentOutcome
 {
     Assigned,
     AlreadyInProgress,
+
+    /// <summary>No vendor in the roster handles this language pair.</summary>
     NoMatchingVendor,
-    VendorReservationFailed
+
+    /// <summary>Every capable vendor declined. A business problem: not enough contracted capacity.</summary>
+    NoCapacityAvailable,
+
+    /// <summary>At least one vendor could not be reached or did not answer. A technical problem.</summary>
+    VendorUnavailable
 }
 
 public static class AssignmentOutcomeExtensions
@@ -23,7 +30,8 @@ public static class AssignmentOutcomeExtensions
         AssignmentOutcome.Assigned => "Assigned",
         AssignmentOutcome.AlreadyInProgress => "Assignment already in progress",
         AssignmentOutcome.NoMatchingVendor => "No matching vendor",
-        AssignmentOutcome.VendorReservationFailed => "Vendor reservation failed",
+        AssignmentOutcome.NoCapacityAvailable => "All capable vendors declined",
+        AssignmentOutcome.VendorUnavailable => "Vendor unavailable",
         _ => outcome.ToString()
     };
 }

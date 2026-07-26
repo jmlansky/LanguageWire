@@ -73,32 +73,58 @@ public sealed class AssignmentEngine(
         return stored?.AsReplay();
     }
 
+    /// <summary>
+    /// Walks the ranked candidates and takes the best one that actually accepts the job. A vendor
+    /// that declines is skipped immediately; one that could not be reached has already exhausted its
+    /// retry policy by the time we see it.
+    /// </summary>
     private async Task<AssignmentResult> ExecuteAsync(
         TranslationJob job,
         IReadOnlyCollection<VendorPartner> vendors,
         string idempotencyKey,
         CancellationToken cancellationToken)
     {
-        var candidate = SelectVendor(job, vendors);
-        if (candidate is null)
+        var candidates = RankCandidates(job, vendors);
+        if (candidates.Count == 0)
         {
             return AssignmentResult.Failed(job.JobId, idempotencyKey, AssignmentOutcome.NoMatchingVendor);
         }
 
-        var reserved = await vendorGateway.ReserveCapacityAsync(candidate, job, cancellationToken);
-        if (!reserved)
+        var anyVendorUnreachable = false;
+
+        foreach (var candidate in candidates)
         {
-            return AssignmentResult.Failed(job.JobId, idempotencyKey, AssignmentOutcome.VendorReservationFailed);
+            var reservation = await vendorGateway.ReserveCapacityAsync(candidate, job, cancellationToken);
+
+            if (reservation.IsReserved)
+            {
+                return AssignmentResult.Assigned(job.JobId, candidate.VendorId, idempotencyKey);
+            }
+
+            // A rejection is a business answer; anything else means we never got one.
+            if (reservation.Status != VendorReservationStatus.Rejected)
+            {
+                anyVendorUnreachable = true;
+            }
         }
 
-        return AssignmentResult.Assigned(job.JobId, candidate.VendorId, idempotencyKey);
+        // Distinguishing the two keeps "we are out of capacity" from paging the on-call engineer.
+        if (anyVendorUnreachable)
+        {
+            return AssignmentResult.Failed(job.JobId, idempotencyKey, AssignmentOutcome.VendorUnavailable);
+        }
+
+        return AssignmentResult.Failed(job.JobId, idempotencyKey, AssignmentOutcome.NoCapacityAvailable);
     }
 
-    private static VendorPartner? SelectVendor(TranslationJob job, IReadOnlyCollection<VendorPartner> vendors)
+    /// <summary>
+    /// Capable vendors in preference order: least loaded first, then cheapest, then best quality.
+    /// </summary>
+    private static List<VendorPartner> RankCandidates(TranslationJob job, IReadOnlyCollection<VendorPartner> vendors)
         => vendors
             .Where(v => v.CanHandle(job.SourceLanguage, job.TargetLanguage))
             .OrderBy(v => v.CurrentLoad / (double)Math.Max(1, v.MaxCapacity))
             .ThenBy(v => v.CostScore)
             .ThenByDescending(v => v.QualityScore)
-            .FirstOrDefault();
+            .ToList();
 }

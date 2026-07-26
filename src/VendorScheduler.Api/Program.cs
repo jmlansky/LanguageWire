@@ -15,8 +15,12 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
 builder.Services.AddSingleton<IIdempotencyStore, InMemoryIdempotencyStore>();
-builder.Services.AddSingleton<IVendorGateway, FakeVendorGateway>();
 builder.Services.AddSingleton<IVendorDirectory, InMemoryVendorDirectory>();
+
+// The engine resolves IVendorGateway and gets the resilient decorator, unaware that retries exist.
+// Swapping FakeVendorGateway for a real vendor client changes only the inner instance.
+builder.Services.AddSingleton<IVendorGateway>(_ =>
+    new ResilientVendorGateway(new FakeVendorGateway(), new VendorResiliencePolicy()));
 builder.Services.AddSingleton<IAssignmentEventPublisher, ConsoleAssignmentEventPublisher>();
 builder.Services.AddScoped<IAssignmentEngine, AssignmentEngine>();
 
@@ -103,7 +107,8 @@ static IResult ToHttpResult(AssignmentResult result) => result.Outcome switch
     AssignmentOutcome.Assigned => Results.Ok(result),
     AssignmentOutcome.AlreadyInProgress => Results.Json(result, statusCode: StatusCodes.Status409Conflict),
     AssignmentOutcome.NoMatchingVendor => Results.Json(result, statusCode: StatusCodes.Status422UnprocessableEntity),
-    AssignmentOutcome.VendorReservationFailed => Results.Json(result, statusCode: StatusCodes.Status503ServiceUnavailable),
+    AssignmentOutcome.NoCapacityAvailable => Results.Json(result, statusCode: StatusCodes.Status503ServiceUnavailable),
+    AssignmentOutcome.VendorUnavailable => Results.Json(result, statusCode: StatusCodes.Status503ServiceUnavailable),
     _ => Results.Json(result, statusCode: StatusCodes.Status500InternalServerError)
 };
 
