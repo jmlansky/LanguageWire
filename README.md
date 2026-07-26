@@ -22,7 +22,7 @@ Submission for the Senior Backend take-home challenge. The original brief is kep
 | 5 | API layer: request validation | 🟡 priority validated; remaining field validation pending |
 | 6 | Observability: structured logs, correlation id, metrics | ✅ done |
 | 7 | Test suite (happy path, no vendor, replay, retry, concurrency) | ✅ all five covered |
-| 8 | Design note + incident playbook | 🟡 design note done, playbook pending |
+| 8 | Design note + incident playbook | ✅ done |
 
 Fault simulation in `FakeVendorGateway` (timeouts, transient failures) is deliberately deferred:
 resilience is proven by the unit tests. Capacity exhaustion, failover and the resulting `503` **can**
@@ -436,4 +436,6 @@ exactly what a real metrics backend does better.
 
 ## Incident playbook
 
-To be completed in step 8.
+[`docs/incident-playbook.md`](docs/incident-playbook.md) — one page, symptom-first: a 60-second
+triage table keyed on the `/metrics` counters, one section per failure scenario with its diagnosis
+and mitigation, and a closing list of what this design cannot mitigate and why that is accepted.
