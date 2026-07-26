@@ -20,15 +20,15 @@ Submission for the Senior Backend take-home challenge. The original brief is kep
 | 3 | Vendor call resilience (timeout, bounded backoff, transient vs terminal) | ✅ done |
 | 4 | Assignment decision: priority, due date, tie-breaks | ✅ done |
 | 5 | API layer: request validation | 🟡 priority validated; remaining field validation pending |
-| 6 | Observability: structured logs, correlation id, metrics | ⬜ pending |
+| 6 | Observability: structured logs, correlation id, metrics | ✅ done |
 | 7 | Test suite (happy path, no vendor, replay, retry, concurrency) | ✅ all five covered |
-| 8 | Design note + incident playbook | 🟡 design note in progress, playbook pending |
+| 8 | Design note + incident playbook | 🟡 design note done, playbook pending |
 
 Fault simulation in `FakeVendorGateway` (timeouts, transient failures) is deliberately deferred:
 resilience is proven by the unit tests. Capacity exhaustion, failover and the resulting `503` **can**
 be staged live through the test-support endpoint below.
 
-Current suite: **30 tests, all passing**.
+Current suite: **58 tests, all passing**.
 
 ---
 
@@ -86,6 +86,7 @@ Then open **http://localhost:5080/swagger** to exercise every endpoint interacti
 | `GET`  | `/api/assignments/{jobId}` | Look up the recorded assignment for a job |
 | `GET`  | `/api/vendors` | List the vendor roster with its **live** load |
 | `PUT`  | `/api/testing/vendors/{vendorId}` | **Test support:** overwrite a vendor's load/capacity |
+| `GET`  | `/metrics` | Counter snapshot (see Observability) |
 | `GET`  | `/health` | Liveness probe |
 
 The read endpoints exist so the idempotency behaviour can be observed directly from Swagger: assign a
@@ -348,7 +349,7 @@ and operability instead.
 
 ## Tests
 
-30 tests, no `sleep` anywhere except a single 50ms timeout probe.
+58 tests, no `sleep` anywhere except a single 50ms timeout probe.
 
 **Assignment engine**
 
@@ -395,9 +396,43 @@ urgency tests pin "now" instead of racing the real one.
 
 ---
 
-## Metrics
+## Observability
 
-To be completed in step 6.
+**Structured logs.** Every assignment logs the decision with its inputs — job, language pair,
+priority, derived urgency, and the ranked candidate list — then one line per vendor that declined
+(with status and rejection reason) and one for the vendor that took it. The resilience layer logs
+each retry as `attempt N/M ... retrying in Xms`, and escalates to `LogError` when a vendor is
+declared unreachable. Failures to assign log at `Warning` with the outcome; successes at
+`Information`. Nothing logs mere activity — each line answers a question someone would actually ask
+during an incident.
+
+**Correlation id.** Every request carries `X-Correlation-Id`: the caller's value if it sent one, a
+fresh one otherwise. It is attached to every log line of that request via a logging scope and echoed
+back in the response, so a client can quote it in a ticket and an operator can pull the whole
+request from the logs with it.
+
+**Metrics.** `GET /metrics` returns a snapshot of the counters below.
+
+| Metric | Type | Breakdown | What it answers |
+|--------|------|-----------|-----------------|
+| `assignments_total` | counter | `outcome` | Volume, and the success rate as `Assigned / total` |
+| `assignments_replayed_total` | counter | — | How much traffic is duplicate requests. A sudden climb means clients are retrying more than they should — usually a symptom, not a cause |
+| `vendor_attempts_total` | counter | `status` | Vendor health: the ratio of `Reserved` to `TransientFailure`/`Uncertain` |
+| `vendor_retries_total` | counter | — | How hard the service is working to get answers. Rising retries with a flat success rate means latency is being absorbed silently |
+
+The two failure outcomes are counted separately on purpose: `NoCapacityAvailable` means capacity has
+to be bought, `VendorUnavailable` means someone should be paged. Same status code for the caller,
+different alert for the operator. `Uncertain` is counted apart from `TransientFailure` for the same
+reason — it is the one that risks a double reservation.
+
+Suggested alerts: success rate below 95% over 15 minutes; any `Uncertain` attempt at all; retries per
+assignment above 1.0; `VendorUnavailable` outcomes above zero for 5 minutes.
+
+**Deliberately not implemented.** The counters are process-local and reset with the process. In
+production they would be OpenTelemetry instruments scraped by the monitoring stack, which is a
+configuration change plus a different `IAssignmentMetrics` adapter — the domain already reports the
+right events, so nothing outside that class would change. Summing them by hand across instances is
+exactly what a real metrics backend does better.
 
 ## Incident playbook
 

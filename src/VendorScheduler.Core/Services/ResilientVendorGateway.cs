@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using VendorScheduler.Core.Contracts;
 using VendorScheduler.Core.Domain;
 
@@ -17,17 +19,23 @@ public sealed class ResilientVendorGateway : IVendorGateway
     private readonly VendorResiliencePolicy _policy;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly Func<double> _jitterSource;
+    private readonly ILogger _logger;
+    private readonly IAssignmentMetrics _metrics;
 
     public ResilientVendorGateway(
         IVendorGateway inner,
         VendorResiliencePolicy? policy = null,
         Func<TimeSpan, CancellationToken, Task>? delay = null,
-        Func<double>? jitterSource = null)
+        Func<double>? jitterSource = null,
+        ILogger<ResilientVendorGateway>? logger = null,
+        IAssignmentMetrics? metrics = null)
     {
         _inner = inner;
         _policy = policy ?? new VendorResiliencePolicy();
         _delay = delay ?? Task.Delay;
         _jitterSource = jitterSource ?? Random.Shared.NextDouble;
+        _logger = logger ?? NullLogger<ResilientVendorGateway>.Instance;
+        _metrics = metrics ?? NoOpAssignmentMetrics.Instance;
     }
 
     public async Task<VendorReservation> ReserveCapacityAsync(
@@ -41,6 +49,7 @@ public sealed class ResilientVendorGateway : IVendorGateway
         for (var attempt = 0; attempt < attempts; attempt++)
         {
             lastOutcome = await AttemptAsync(vendor, job, cancellationToken);
+            _metrics.VendorAttempt(lastOutcome.Status);
 
             // Reserved is done; Rejected is the vendor's final answer, so neither is retried.
             if (!lastOutcome.IsRetryable)
@@ -51,10 +60,19 @@ public sealed class ResilientVendorGateway : IVendorGateway
             var isLastAttempt = attempt == attempts - 1;
             if (isLastAttempt)
             {
+                _logger.LogError(
+                    "Vendor {VendorName} unreachable for job {JobId} after {Attempts} attempt(s): {Status} ({Detail})",
+                    vendor.Name, job.JobId, attempts, lastOutcome.Status, lastOutcome.Detail);
                 return lastOutcome;
             }
 
-            await _delay(CalculateBackoff(attempt), cancellationToken);
+            var backoff = CalculateBackoff(attempt);
+            _metrics.VendorRetryScheduled();
+            _logger.LogWarning(
+                "Vendor {VendorName} attempt {Attempt}/{MaxAttempts} for job {JobId} failed: {Status} ({Detail}). Retrying in {BackoffMs}ms",
+                vendor.Name, attempt + 1, attempts, job.JobId, lastOutcome.Status, lastOutcome.Detail, backoff.TotalMilliseconds);
+
+            await _delay(backoff, cancellationToken);
         }
 
         return lastOutcome;

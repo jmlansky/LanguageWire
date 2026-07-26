@@ -24,12 +24,17 @@ builder.Services.AddSingleton<IVendorDirectory>(sp => sp.GetRequiredService<InMe
 
 builder.Services.AddSingleton<IAssignmentEventPublisher, ConsoleAssignmentEventPublisher>();
 
+builder.Services.AddSingleton<InMemoryAssignmentMetrics>();
+builder.Services.AddSingleton<IAssignmentMetrics>(sp => sp.GetRequiredService<InMemoryAssignmentMetrics>());
+
 // The engine resolves IVendorGateway and gets the resilient decorator, unaware that retries exist.
 // Swapping FakeVendorGateway for a real vendor client changes only the inner instance.
 builder.Services.AddSingleton<IVendorGateway>(sp =>
     new ResilientVendorGateway(
         new FakeVendorGateway(sp.GetRequiredService<InMemoryVendorDirectory>()),
-        new VendorResiliencePolicy()));
+        new VendorResiliencePolicy(),
+        logger: sp.GetRequiredService<ILogger<ResilientVendorGateway>>(),
+        metrics: sp.GetRequiredService<IAssignmentMetrics>()));
 
 builder.Services.AddScoped<IAssignmentEngine, AssignmentEngine>();
 
@@ -40,6 +45,27 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+
+// Correlation id: honour the caller's if it sent one, mint one otherwise, put it on every log line
+// of the request through a logging scope, and echo it back so the caller can quote it in a ticket.
+app.Use(async (context, next) =>
+{
+    var correlationId = context.Request.Headers[CorrelationIdHeader].FirstOrDefault();
+    if (string.IsNullOrWhiteSpace(correlationId))
+    {
+        correlationId = Guid.NewGuid().ToString("N");
+    }
+
+    context.Response.Headers[CorrelationIdHeader] = correlationId;
+
+    var loggerFactory = context.RequestServices.GetRequiredService<ILoggerFactory>();
+    var logger = loggerFactory.CreateLogger("VendorScheduler.Api.Request");
+
+    using (logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = correlationId }))
+    {
+        await next();
+    }
+});
 
 app.MapPost("/api/assignments", async (
     AssignmentRequest request,
@@ -126,6 +152,12 @@ app.MapPut("/api/testing/vendors/{vendorId:guid}", (
 .Produces(StatusCodes.Status204NoContent)
 .Produces<NotFoundResponse>(StatusCodes.Status404NotFound);
 
+app.MapGet("/metrics", (InMemoryAssignmentMetrics metrics) => Results.Ok(metrics.Snapshot()))
+.WithName("GetMetrics")
+.WithTags("Operations")
+.WithDescription("Process-local counters. In production these would be OpenTelemetry instruments scraped by the monitoring stack; this snapshot exists to make them observable here.")
+.Produces<MetricsSnapshot>(StatusCodes.Status200OK);
+
 app.MapGet("/health", () => Results.Ok(new HealthResponse("healthy")))
 .WithName("GetHealth")
 .WithTags("Operations")
@@ -147,6 +179,11 @@ static IResult ToHttpResult(AssignmentResult result) => result.Outcome switch
     AssignmentOutcome.VendorUnavailable => Results.Json(result, statusCode: StatusCodes.Status503ServiceUnavailable),
     _ => Results.Json(result, statusCode: StatusCodes.Status500InternalServerError)
 };
+
+public partial class Program
+{
+    public const string CorrelationIdHeader = "X-Correlation-Id";
+}
 
 public sealed record AssignmentRequest(
     Guid JobId,
