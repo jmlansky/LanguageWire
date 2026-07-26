@@ -13,26 +13,32 @@ public sealed class AssignmentEngine(
         IReadOnlyCollection<VendorPartner> vendors,
         CancellationToken cancellationToken = default)
     {
-        var idempotencyKey = BuildKey(job.JobId);
+        var idempotencyKey = AssignmentKeys.For(job.JobId);
 
-        // Otra request ganó la clave y sigue en vuelo: no ejecutamos nada, el cliente reintenta.
+        // Fast path: the job was already assigned, so replay the stored result untouched.
+        var stored = await TryReplayAsync(idempotencyKey, cancellationToken);
+        if (stored is not null)
+        {
+            return stored;
+        }
+
         var started = await idempotencyStore.TryStartAsync(idempotencyKey, cancellationToken);
         if (!started)
         {
-            return Failed(job.JobId, idempotencyKey, "Assignment already in progress");
+            return await ResolveLostRaceAsync(job.JobId, idempotencyKey, cancellationToken);
         }
 
         try
         {
             var result = await ExecuteAsync(job, vendors, idempotencyKey, cancellationToken);
 
-            // Solo un resultado exitoso se vuelve definitivo. Un fallo deja el job reintentable.
+            // Only a successful result becomes final. A failure leaves the job retryable.
             if (!result.Success)
             {
                 return result;
             }
 
-            // Persistimos antes de publicar: si el publish falla, la asignación no se pierde.
+            // Persist before publishing: if the publisher throws, the assignment is not lost.
             await idempotencyStore.SaveCompletedAsync(idempotencyKey, result, cancellationToken);
             await eventPublisher.PublishAssignedAsync(result, cancellationToken);
             return result;
@@ -41,6 +47,30 @@ public sealed class AssignmentEngine(
         {
             await idempotencyStore.ReleaseInFlightAsync(idempotencyKey, cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Another request owns the key. It may have completed between our replay check and our attempt
+    /// to start, so we look once more before declaring the assignment in progress.
+    /// </summary>
+    private async Task<AssignmentResult> ResolveLostRaceAsync(
+        Guid jobId,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        var stored = await TryReplayAsync(idempotencyKey, cancellationToken);
+        if (stored is not null)
+        {
+            return stored;
+        }
+
+        return AssignmentResult.Failed(jobId, idempotencyKey, AssignmentOutcome.AlreadyInProgress);
+    }
+
+    private async Task<AssignmentResult?> TryReplayAsync(string idempotencyKey, CancellationToken cancellationToken)
+    {
+        var stored = await idempotencyStore.TryGetCompletedAsync(idempotencyKey, cancellationToken);
+        return stored?.AsReplay();
     }
 
     private async Task<AssignmentResult> ExecuteAsync(
@@ -52,23 +82,16 @@ public sealed class AssignmentEngine(
         var candidate = SelectVendor(job, vendors);
         if (candidate is null)
         {
-            return Failed(job.JobId, idempotencyKey, "No matching vendor");
+            return AssignmentResult.Failed(job.JobId, idempotencyKey, AssignmentOutcome.NoMatchingVendor);
         }
 
         var reserved = await vendorGateway.ReserveCapacityAsync(candidate, job, cancellationToken);
         if (!reserved)
         {
-            return Failed(job.JobId, idempotencyKey, "Vendor reservation failed");
+            return AssignmentResult.Failed(job.JobId, idempotencyKey, AssignmentOutcome.VendorReservationFailed);
         }
 
-        return new AssignmentResult
-        {
-            Success = true,
-            JobId = job.JobId,
-            VendorId = candidate.VendorId,
-            Reason = "Assigned",
-            IdempotencyKey = idempotencyKey
-        };
+        return AssignmentResult.Assigned(job.JobId, candidate.VendorId, idempotencyKey);
     }
 
     private static VendorPartner? SelectVendor(TranslationJob job, IReadOnlyCollection<VendorPartner> vendors)
@@ -78,16 +101,4 @@ public sealed class AssignmentEngine(
             .ThenBy(v => v.CostScore)
             .ThenByDescending(v => v.QualityScore)
             .FirstOrDefault();
-
-    private static string BuildKey(Guid jobId) => $"assign:{jobId}";
-
-    private static AssignmentResult Failed(Guid jobId, string idempotencyKey, string reason)
-        => new()
-        {
-            Success = false,
-            JobId = jobId,
-            VendorId = null,
-            Reason = reason,
-            IdempotencyKey = idempotencyKey
-        };
 }

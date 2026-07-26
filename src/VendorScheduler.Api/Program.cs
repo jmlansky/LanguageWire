@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using VendorScheduler.Core.Contracts;
 using VendorScheduler.Core.Domain;
 using VendorScheduler.Core.Services;
@@ -8,8 +9,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// Outcomes travel as names ("NoMatchingVendor"), not ordinals, so the contract stays readable and
+// does not silently change meaning if the enum is ever reordered.
+builder.Services.ConfigureHttpJsonOptions(options =>
+    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+
 builder.Services.AddSingleton<IIdempotencyStore, InMemoryIdempotencyStore>();
 builder.Services.AddSingleton<IVendorGateway, FakeVendorGateway>();
+builder.Services.AddSingleton<IVendorDirectory, InMemoryVendorDirectory>();
 builder.Services.AddSingleton<IAssignmentEventPublisher, ConsoleAssignmentEventPublisher>();
 builder.Services.AddScoped<IAssignmentEngine, AssignmentEngine>();
 
@@ -24,6 +31,8 @@ if (app.Environment.IsDevelopment())
 app.MapPost("/api/assignments", async (
     AssignmentRequest request,
     IAssignmentEngine assignmentEngine,
+    IVendorDirectory vendorDirectory,
+    HttpContext httpContext,
     CancellationToken cancellationToken) =>
 {
     var job = new TranslationJob
@@ -35,35 +44,68 @@ app.MapPost("/api/assignments", async (
         DueAtUtc = request.DueAtUtc
     };
 
-    var vendors = new List<VendorPartner>
-    {
-        new()
-        {
-            VendorId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
-            Name = "VendorA",
-            SupportedPairs = new[] { "en->de", "en->fr" },
-            MaxCapacity = 100,
-            CurrentLoad = 35,
-            CostScore = 0.75m,
-            QualityScore = 0.90m
-        },
-        new()
-        {
-            VendorId = Guid.Parse("22222222-2222-2222-2222-222222222222"),
-            Name = "VendorB",
-            SupportedPairs = new[] { "en->de", "de->en" },
-            MaxCapacity = 120,
-            CurrentLoad = 50,
-            CostScore = 0.70m,
-            QualityScore = 0.85m
-        }
-    };
-
+    var vendors = await vendorDirectory.GetVendorsAsync(cancellationToken);
     var result = await assignmentEngine.AssignAsync(job, vendors, cancellationToken);
-    return Results.Ok(result);
-});
+
+    if (result.IsReplay)
+    {
+        httpContext.Response.Headers.Append("Idempotent-Replay", "true");
+    }
+
+    return ToHttpResult(result);
+})
+.WithName("CreateAssignment")
+.WithTags("Assignments")
+.Produces<AssignmentResult>(StatusCodes.Status200OK)
+.Produces<AssignmentResult>(StatusCodes.Status409Conflict)
+.Produces<AssignmentResult>(StatusCodes.Status422UnprocessableEntity)
+.Produces<AssignmentResult>(StatusCodes.Status503ServiceUnavailable);
+
+app.MapGet("/api/assignments/{jobId:guid}", async (
+    Guid jobId,
+    IIdempotencyStore idempotencyStore,
+    CancellationToken cancellationToken) =>
+{
+    var stored = await idempotencyStore.TryGetCompletedAsync(AssignmentKeys.For(jobId), cancellationToken);
+    if (stored is null)
+    {
+        return Results.NotFound(new NotFoundResponse(jobId, "No completed assignment recorded for this job"));
+    }
+
+    return Results.Ok(stored);
+})
+.WithName("GetAssignment")
+.WithTags("Assignments")
+.Produces<AssignmentResult>(StatusCodes.Status200OK)
+.Produces<NotFoundResponse>(StatusCodes.Status404NotFound);
+
+app.MapGet("/api/vendors", async (
+    IVendorDirectory vendorDirectory,
+    CancellationToken cancellationToken) => Results.Ok(await vendorDirectory.GetVendorsAsync(cancellationToken)))
+.WithName("GetVendors")
+.WithTags("Vendors")
+.Produces<IReadOnlyCollection<VendorPartner>>(StatusCodes.Status200OK);
+
+app.MapGet("/health", () => Results.Ok(new HealthResponse("healthy")))
+.WithName("GetHealth")
+.WithTags("Operations")
+.Produces<HealthResponse>(StatusCodes.Status200OK);
 
 app.Run();
+
+/// <summary>
+/// Maps an assignment outcome to an HTTP status so callers can act on the response without parsing
+/// the body: 409 means "retry later", 422 means "this request can never be fulfilled as-is", and
+/// 503 means "the vendor side failed, retrying is worthwhile".
+/// </summary>
+static IResult ToHttpResult(AssignmentResult result) => result.Outcome switch
+{
+    AssignmentOutcome.Assigned => Results.Ok(result),
+    AssignmentOutcome.AlreadyInProgress => Results.Json(result, statusCode: StatusCodes.Status409Conflict),
+    AssignmentOutcome.NoMatchingVendor => Results.Json(result, statusCode: StatusCodes.Status422UnprocessableEntity),
+    AssignmentOutcome.VendorReservationFailed => Results.Json(result, statusCode: StatusCodes.Status503ServiceUnavailable),
+    _ => Results.Json(result, statusCode: StatusCodes.Status500InternalServerError)
+};
 
 public sealed record AssignmentRequest(
     Guid JobId,
@@ -71,3 +113,7 @@ public sealed record AssignmentRequest(
     string TargetLanguage,
     string Priority,
     DateTime DueAtUtc);
+
+public sealed record NotFoundResponse(Guid JobId, string Reason);
+
+public sealed record HealthResponse(string Status);
