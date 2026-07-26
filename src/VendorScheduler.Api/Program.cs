@@ -48,23 +48,19 @@ app.MapPost("/api/assignments", async (
     HttpContext httpContext,
     CancellationToken cancellationToken) =>
 {
-    // The wire format keeps priority as a string; it is validated here, at the boundary, so the
-    // engine only ever sees a typed value.
-    if (!Enum.TryParse<JobPriority>(request.Priority, ignoreCase: true, out var priority))
-    {
-        return Results.BadRequest(new ValidationErrorResponse(
-            request.JobId,
-            $"Unknown priority '{request.Priority}'. Valid values: {string.Join(", ", Enum.GetNames<JobPriority>())}"));
-    }
+    // The request is untrusted until it becomes a TranslationJob; the engine never sees a raw one.
+    var validation = TranslationJobValidator.Validate(
+        request.JobId,
+        request.SourceLanguage,
+        request.TargetLanguage,
+        request.Priority,
+        request.DueAtUtc,
+        DateTime.UtcNow);
 
-    var job = new TranslationJob
+    if (validation.Job is not { } job)
     {
-        JobId = request.JobId,
-        SourceLanguage = request.SourceLanguage,
-        TargetLanguage = request.TargetLanguage,
-        Priority = priority,
-        DueAtUtc = request.DueAtUtc
-    };
+        return Results.BadRequest(new ValidationErrorResponse(request.JobId, validation.Errors));
+    }
 
     var vendors = await vendorDirectory.GetVendorsAsync(cancellationToken);
     var result = await assignmentEngine.AssignAsync(job, vendors, cancellationToken);
@@ -161,7 +157,7 @@ public sealed record AssignmentRequest(
 
 public sealed record VendorStateRequest(int CurrentLoad, int MaxCapacity);
 
-public sealed record ValidationErrorResponse(Guid JobId, string Error);
+public sealed record ValidationErrorResponse(Guid JobId, IReadOnlyCollection<string> Errors);
 
 public sealed record NotFoundResponse(Guid Id, string Reason);
 
