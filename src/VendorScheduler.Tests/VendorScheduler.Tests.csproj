@@ -19,5 +19,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\VendorScheduler.Core\VendorScheduler.Core.csproj" />
+    <ProjectReference Include="..\VendorScheduler.Infrastructure\VendorScheduler.Infrastructure.csproj" />
   </ItemGroup>
 </Project>

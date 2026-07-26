@@ -18,16 +18,17 @@ Submission for the Senior Backend take-home challenge. The original brief is kep
 | 1 | Baseline fixed and building, first test in place | ✅ done |
 | 2 | Idempotency: deterministic replay + in-progress rejection | ✅ done |
 | 3 | Vendor call resilience (timeout, bounded backoff, transient vs terminal) | ✅ done |
-| 4 | Assignment decision: priority, due date, tie-breaks | ⬜ pending |
-| 5 | API layer: request validation | 🟡 endpoints and status codes done, input validation pending |
+| 4 | Assignment decision: priority, due date, tie-breaks | ✅ done |
+| 5 | API layer: request validation | 🟡 priority validated; remaining field validation pending |
 | 6 | Observability: structured logs, correlation id, metrics | ⬜ pending |
 | 7 | Test suite (happy path, no vendor, replay, retry, concurrency) | ✅ all five covered |
 | 8 | Design note + incident playbook | 🟡 design note in progress, playbook pending |
 
-Fault simulation in `FakeVendorGateway` is deliberately deferred: resilience is proven by the unit
-tests, and teaching the fake to fail is what will make it observable from Swagger.
+Fault simulation in `FakeVendorGateway` (timeouts, transient failures) is deliberately deferred:
+resilience is proven by the unit tests. Capacity exhaustion, failover and the resulting `503` **can**
+be staged live through the test-support endpoint below.
 
-Current suite: **18 tests, all passing**.
+Current suite: **30 tests, all passing**.
 
 ---
 
@@ -83,11 +84,27 @@ Then open **http://localhost:5080/swagger** to exercise every endpoint interacti
 |--------|-------|---------|
 | `POST` | `/api/assignments` | Assign a translation job to a vendor |
 | `GET`  | `/api/assignments/{jobId}` | Look up the recorded assignment for a job |
-| `GET`  | `/api/vendors` | List the vendor roster used for assignment decisions |
+| `GET`  | `/api/vendors` | List the vendor roster with its **live** load |
+| `PUT`  | `/api/testing/vendors/{vendorId}` | **Test support:** overwrite a vendor's load/capacity |
 | `GET`  | `/health` | Liveness probe |
 
 The read endpoints exist so the idempotency behaviour can be observed directly from Swagger: assign a
 job, then re-post the same `jobId` and query it, without needing to read the service logs.
+
+The `testing` endpoint stands in for the vendor management service that would own vendor state in the
+real system. It exists so failover and capacity exhaustion are reproducible live — fill a vendor,
+watch assignments fail over to the next one, fill them all and watch the `503` — and it would not
+ship in production. Example scenario:
+
+```bash
+# Fill VendorA; the next en->de job fails over to VendorB
+curl -X PUT localhost:5080/api/testing/vendors/11111111-1111-1111-1111-111111111111 \
+     -H "Content-Type: application/json" -d '{"currentLoad":100,"maxCapacity":100}'
+
+# Fill VendorB too; the next job returns 503 NoCapacityAvailable
+curl -X PUT localhost:5080/api/testing/vendors/22222222-2222-2222-2222-222222222222 \
+     -H "Content-Type: application/json" -d '{"currentLoad":120,"maxCapacity":120}'
+```
 
 ### `POST /api/assignments`
 
@@ -115,8 +132,10 @@ Response:
 }
 ```
 
-`jobId` is the idempotency key of the request. Outcomes map to HTTP status codes so a caller can act
-on the response without parsing the body:
+`jobId` is the idempotency key of the request. `priority` must be one of `Low`, `Normal`, `High`
+(case-insensitive); anything else is rejected with `400` at the boundary, so the engine only ever
+sees a typed value. Outcomes map to HTTP status codes so a caller can act on the response without
+parsing the body:
 
 | Outcome | Status | Meaning for the caller |
 |---------|--------|------------------------|
@@ -224,10 +243,9 @@ calling, so seeing it means our view of the vendor's catalogue is stale. That is
 
 ### The best vendor that accepts, not merely the best one
 
-Candidates are ranked (least loaded, then cheapest, then best quality) and the engine now walks that
-ranking instead of giving up on the first one. A vendor that declines is skipped immediately without
-retries; one that could not be reached has already exhausted its retry policy by the time the engine
-sees it.
+Candidates are ranked and the engine walks that ranking instead of giving up on the first one. A
+vendor that declines is skipped immediately without retries; one that could not be reached has
+already exhausted its retry policy by the time the engine sees it.
 
 If the list runs out, the outcome distinguishes **why**: `NoCapacityAvailable` when everyone simply
 declined, `VendorUnavailable` when at least one vendor never answered. Under a boolean both were the
@@ -246,6 +264,47 @@ became negligible once the backoff grew and stopped spreading retries apart.
 
 Timeouts are classified as `Uncertain`, never as clean failures. Caller cancellation is rethrown
 instead of being swallowed: a client that walked away is not a vendor problem and must not be retried.
+
+### Urgency is computed, never stored
+
+Priority is a typed enum (`Low`/`Normal`/`High`) validated at the API boundary. The engine does not
+use it directly: it derives an **urgency** at evaluation time — `High` priority, or a due date within
+24 hours, means urgent. The deadline dominates: a `Low` job about to expire is urgent no matter what
+it declared.
+
+Urgency picks the ranking:
+
+| | 1st | 2nd | 3rd |
+|---|---|---|---|
+| **Urgent** | best quality | least loaded | cheapest |
+| **Normal** | least loaded | cheapest | best quality |
+
+Urgent work goes to the best vendor; routine work to the most convenient one. Two discrete rankings
+were chosen over a weighted score on purpose: every decision is explainable ("urgent, so quality
+first"), while a `0.4×load + 0.3×cost` formula invites an argument about the weights that no one can
+win.
+
+Computing urgency at evaluation time, rather than storing it, matters in this architecture. There is
+no queue: a job that cannot be assigned leaves the system as a `503` and lives with the client, who
+retries. When the retry arrives days later with the same due date, the margin has shrunk and the job
+escalates **on its own** — no scheduler re-prioritises anything, because urgency was never a stored
+fact that could go stale. The honest limitation: this works only if the client retries. Rescuing
+abandoned jobs would take an internal queue and a background re-evaluator, which is a different
+architecture (and API contract) than the synchronous assign-on-arrival the starter defines — noted
+as a deliberate boundary, not an oversight.
+
+### Vendor load is live, and its owner is simulated
+
+The starter's roster was frozen: `CurrentLoad` never moved, so "least loaded" always picked the same
+vendor. Load now lives in `InMemoryVendorDirectory`, the stand-in for the **vendor management
+service** that would own this data in the real system: a successful reservation consumes a slot
+(atomically — a concurrency test proves capacity is never oversold), snapshots served to the engine
+reflect it, and a full vendor starts rejecting with `NoCapacity`, which is what makes failover and
+`NoCapacityAvailable` reproducible from Swagger via the test-support endpoint.
+
+The dependency of `FakeVendorGateway` on the directory is fake-to-fake, inside Infrastructure; Core
+never sees it. In production the load would be reported by the vendor's API, not tracked by us —
+this simulation exists to make the assignment behaviour observable, and resets with the process.
 
 ### Outcomes are a closed set, not free text
 
@@ -289,7 +348,7 @@ and operability instead.
 
 ## Tests
 
-18 tests, no `sleep` anywhere except a single 50ms timeout probe.
+30 tests, no `sleep` anywhere except a single 50ms timeout probe.
 
 **Assignment engine**
 
@@ -319,9 +378,20 @@ and operability instead.
 | `WhenGatewayThrows_TreatsItAsTransientAndRetries` | A throwing client is classified, not leaked |
 | `WhenCallerCancels_PropagatesInsteadOfSwallowing` | Caller cancellation is not mistaken for a vendor fault |
 
-Two details make the suite deterministic: the in-flight test uses a gateway that parks inside the call
-until released, so the overlap does not depend on timing; and the resilience tests inject the wait, so
-the backoff schedule is asserted rather than endured.
+**Assignment decision**
+
+| Test | What it protects |
+|------|------------------|
+| `UrgencyPolicyTests` (5) | High is always urgent; the deadline dominates declared priority; a job escalates on its own as its due date approaches |
+| `NormalJob_PrefersTheLeastLoadedVendor` | Routine work goes to the most convenient vendor |
+| `UrgentJob_PrefersTheBestQualityVendorEvenIfBusier` | Urgent work goes to the best vendor |
+| `UrgentJobWhosePremiumVendorIsFull_FallsBackByQualityOrder` | Failover follows the urgent ranking, not the normal one |
+| `InMemoryVendorDirectoryTests` (4) | Reservations consume capacity, staging works, and 100 concurrent reservations never oversell 10 slots |
+
+Three details make the suite deterministic: the in-flight test uses a gateway that parks inside the
+call until released, so the overlap does not depend on timing; the resilience tests inject the wait,
+so the backoff schedule is asserted rather than endured; and the engine takes an injectable clock, so
+urgency tests pin "now" instead of racing the real one.
 
 ---
 

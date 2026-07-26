@@ -6,14 +6,19 @@ namespace VendorScheduler.Tests;
 
 internal static class TestData
 {
-    public static TranslationJob Job(Guid? jobId = null, string source = "en", string target = "de")
+    public static TranslationJob Job(
+        Guid? jobId = null,
+        string source = "en",
+        string target = "de",
+        JobPriority priority = JobPriority.Normal,
+        DateTime? dueAtUtc = null)
         => new()
         {
             JobId = jobId ?? Guid.NewGuid(),
             SourceLanguage = source,
             TargetLanguage = target,
-            Priority = "normal",
-            DueAtUtc = DateTime.UtcNow.AddDays(1)
+            Priority = priority,
+            DueAtUtc = dueAtUtc ?? DateTime.UtcNow.AddDays(30)
         };
 
     public static VendorPartner Vendor(

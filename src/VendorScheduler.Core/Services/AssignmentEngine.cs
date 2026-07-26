@@ -6,8 +6,11 @@ namespace VendorScheduler.Core.Services;
 public sealed class AssignmentEngine(
     IVendorGateway vendorGateway,
     IIdempotencyStore idempotencyStore,
-    IAssignmentEventPublisher eventPublisher) : IAssignmentEngine
+    IAssignmentEventPublisher eventPublisher,
+    Func<DateTime>? utcNow = null) : IAssignmentEngine
 {
+    private readonly Func<DateTime> _utcNow = utcNow ?? (static () => DateTime.UtcNow);
+
     public async Task<AssignmentResult> AssignAsync(
         TranslationJob job,
         IReadOnlyCollection<VendorPartner> vendors,
@@ -118,13 +121,30 @@ public sealed class AssignmentEngine(
     }
 
     /// <summary>
-    /// Capable vendors in preference order: least loaded first, then cheapest, then best quality.
+    /// Capable vendors in preference order. Urgency — derived here, at evaluation time — picks the
+    /// ranking: urgent work goes to the best vendor (quality first), routine work to the most
+    /// convenient one (load, then cost).
     /// </summary>
-    private static List<VendorPartner> RankCandidates(TranslationJob job, IReadOnlyCollection<VendorPartner> vendors)
-        => vendors
-            .Where(v => v.CanHandle(job.SourceLanguage, job.TargetLanguage))
-            .OrderBy(v => v.CurrentLoad / (double)Math.Max(1, v.MaxCapacity))
+    private List<VendorPartner> RankCandidates(TranslationJob job, IReadOnlyCollection<VendorPartner> vendors)
+    {
+        var capable = vendors.Where(v => v.CanHandle(job.SourceLanguage, job.TargetLanguage));
+
+        if (UrgencyPolicy.Evaluate(job, _utcNow()) == JobUrgency.Urgent)
+        {
+            return capable
+                .OrderByDescending(v => v.QualityScore)
+                .ThenBy(v => LoadRatio(v))
+                .ThenBy(v => v.CostScore)
+                .ToList();
+        }
+
+        return capable
+            .OrderBy(v => LoadRatio(v))
             .ThenBy(v => v.CostScore)
             .ThenByDescending(v => v.QualityScore)
             .ToList();
+    }
+
+    private static double LoadRatio(VendorPartner vendor)
+        => vendor.CurrentLoad / (double)Math.Max(1, vendor.MaxCapacity);
 }

@@ -4,29 +4,29 @@ using VendorScheduler.Core.Domain;
 namespace VendorScheduler.Infrastructure;
 
 /// <summary>
-/// Stand-in for the vendor API: one call, one answer, no retry logic. The retry policy that used to
-/// live here now sits in <c>ResilientVendorGateway</c>, so it is not lost when this class is replaced
-/// by a real vendor client.
+/// Stand-in for the vendor API: one call, one answer, no retry logic. Retry policy lives in
+/// <c>ResilientVendorGateway</c>, so it is not lost when this class is replaced by a real client.
 /// </summary>
 /// <remarks>
-/// This fake always answers cleanly — it never times out, fails or replies partially. Fault
-/// simulation is deliberately deferred to a follow-up step; until then the resilience behaviour is
-/// covered by the unit tests, not by running the API.
+/// Capacity truth lives in <see cref="InMemoryVendorDirectory"/> — the simulated vendor side — and a
+/// reservation consumes one slot there, so repeated assignments visibly fill a vendor up until it
+/// starts rejecting. The dependency is fake-to-fake, inside Infrastructure; Core never sees it.
+/// This fake still never times out or fails transiently; fault simulation is a deferred follow-up.
 /// </remarks>
-public sealed class FakeVendorGateway : IVendorGateway
+public sealed class FakeVendorGateway(InMemoryVendorDirectory vendorDirectory) : IVendorGateway
 {
     public Task<VendorReservation> ReserveCapacityAsync(
         VendorPartner vendor,
         TranslationJob job,
         CancellationToken cancellationToken = default)
     {
-        if (vendor.CurrentLoad >= vendor.MaxCapacity)
+        if (vendorDirectory.TryReserveSlot(vendor.VendorId))
         {
-            return Task.FromResult(VendorReservation.Rejected(
-                VendorRejectionReason.NoCapacity,
-                $"{vendor.Name} is at {vendor.CurrentLoad}/{vendor.MaxCapacity}"));
+            return Task.FromResult(VendorReservation.Reserved());
         }
 
-        return Task.FromResult(VendorReservation.Reserved());
+        return Task.FromResult(VendorReservation.Rejected(
+            VendorRejectionReason.NoCapacity,
+            $"{vendor.Name} is at full capacity"));
     }
 }

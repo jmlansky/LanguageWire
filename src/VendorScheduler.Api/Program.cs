@@ -15,13 +15,22 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
 builder.Services.AddSingleton<IIdempotencyStore, InMemoryIdempotencyStore>();
-builder.Services.AddSingleton<IVendorDirectory, InMemoryVendorDirectory>();
+
+// One concrete directory instance plays two roles: the roster the engine reads, and the simulated
+// vendor side whose capacity the fake gateway consumes. In the real system that second role belongs
+// to a separate vendor management service.
+builder.Services.AddSingleton<InMemoryVendorDirectory>();
+builder.Services.AddSingleton<IVendorDirectory>(sp => sp.GetRequiredService<InMemoryVendorDirectory>());
+
+builder.Services.AddSingleton<IAssignmentEventPublisher, ConsoleAssignmentEventPublisher>();
 
 // The engine resolves IVendorGateway and gets the resilient decorator, unaware that retries exist.
 // Swapping FakeVendorGateway for a real vendor client changes only the inner instance.
-builder.Services.AddSingleton<IVendorGateway>(_ =>
-    new ResilientVendorGateway(new FakeVendorGateway(), new VendorResiliencePolicy()));
-builder.Services.AddSingleton<IAssignmentEventPublisher, ConsoleAssignmentEventPublisher>();
+builder.Services.AddSingleton<IVendorGateway>(sp =>
+    new ResilientVendorGateway(
+        new FakeVendorGateway(sp.GetRequiredService<InMemoryVendorDirectory>()),
+        new VendorResiliencePolicy()));
+
 builder.Services.AddScoped<IAssignmentEngine, AssignmentEngine>();
 
 var app = builder.Build();
@@ -39,12 +48,21 @@ app.MapPost("/api/assignments", async (
     HttpContext httpContext,
     CancellationToken cancellationToken) =>
 {
+    // The wire format keeps priority as a string; it is validated here, at the boundary, so the
+    // engine only ever sees a typed value.
+    if (!Enum.TryParse<JobPriority>(request.Priority, ignoreCase: true, out var priority))
+    {
+        return Results.BadRequest(new ValidationErrorResponse(
+            request.JobId,
+            $"Unknown priority '{request.Priority}'. Valid values: {string.Join(", ", Enum.GetNames<JobPriority>())}"));
+    }
+
     var job = new TranslationJob
     {
         JobId = request.JobId,
         SourceLanguage = request.SourceLanguage,
         TargetLanguage = request.TargetLanguage,
-        Priority = request.Priority,
+        Priority = priority,
         DueAtUtc = request.DueAtUtc
     };
 
@@ -61,6 +79,7 @@ app.MapPost("/api/assignments", async (
 .WithName("CreateAssignment")
 .WithTags("Assignments")
 .Produces<AssignmentResult>(StatusCodes.Status200OK)
+.Produces<ValidationErrorResponse>(StatusCodes.Status400BadRequest)
 .Produces<AssignmentResult>(StatusCodes.Status409Conflict)
 .Produces<AssignmentResult>(StatusCodes.Status422UnprocessableEntity)
 .Produces<AssignmentResult>(StatusCodes.Status503ServiceUnavailable);
@@ -90,6 +109,27 @@ app.MapGet("/api/vendors", async (
 .WithTags("Vendors")
 .Produces<IReadOnlyCollection<VendorPartner>>(StatusCodes.Status200OK);
 
+// Test support: in the real system vendor state is owned by a separate vendor management service.
+// This endpoint stands in for it so failover and capacity-exhaustion scenarios can be staged from
+// Swagger. It would not ship in production.
+app.MapPut("/api/testing/vendors/{vendorId:guid}", (
+    Guid vendorId,
+    VendorStateRequest request,
+    InMemoryVendorDirectory vendorDirectory) =>
+{
+    if (!vendorDirectory.TrySetState(vendorId, request.CurrentLoad, request.MaxCapacity))
+    {
+        return Results.NotFound(new NotFoundResponse(vendorId, "Unknown vendor"));
+    }
+
+    return Results.NoContent();
+})
+.WithName("SetVendorState")
+.WithTags("Testing")
+.WithDescription("Test support only: overwrites a vendor's load/capacity to stage assignment scenarios.")
+.Produces(StatusCodes.Status204NoContent)
+.Produces<NotFoundResponse>(StatusCodes.Status404NotFound);
+
 app.MapGet("/health", () => Results.Ok(new HealthResponse("healthy")))
 .WithName("GetHealth")
 .WithTags("Operations")
@@ -100,7 +140,7 @@ app.Run();
 /// <summary>
 /// Maps an assignment outcome to an HTTP status so callers can act on the response without parsing
 /// the body: 409 means "retry later", 422 means "this request can never be fulfilled as-is", and
-/// 503 means "the vendor side failed, retrying is worthwhile".
+/// 503 means "capacity or availability problem, retrying is worthwhile".
 /// </summary>
 static IResult ToHttpResult(AssignmentResult result) => result.Outcome switch
 {
@@ -119,6 +159,10 @@ public sealed record AssignmentRequest(
     string Priority,
     DateTime DueAtUtc);
 
-public sealed record NotFoundResponse(Guid JobId, string Reason);
+public sealed record VendorStateRequest(int CurrentLoad, int MaxCapacity);
+
+public sealed record ValidationErrorResponse(Guid JobId, string Error);
+
+public sealed record NotFoundResponse(Guid Id, string Reason);
 
 public sealed record HealthResponse(string Status);
